@@ -1,0 +1,435 @@
+{
+  "name": "IoT Anomaly Detection Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "iot-sensor-data",
+        "options": {}
+      },
+      "id": "webhook-sensor-data",
+      "name": "IoT Sensor Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "iot-sensor-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract and validate sensor data\nconst sensorData = $input.first().json;\n\n// Validate required fields\nif (!sensorData.machineId || !sensorData.timestamp) {\n  throw new Error('Missing required fields: machineId or timestamp');\n}\n\n// Extract sensor readings\nconst readings = {\n  machineId: sensorData.machineId,\n  timestamp: new Date(sensorData.timestamp).toISOString(),\n  temperature: parseFloat(sensorData.temperature) || 0,\n  pressure: parseFloat(sensorData.pressure) || 0,\n  vibration: parseFloat(sensorData.vibration) || 0,\n  humidity: parseFloat(sensorData.humidity) || 0,\n  rpm: parseFloat(sensorData.rpm) || 0\n};\n\n// Add derived metrics\nreadings.temperaturePressureRatio = readings.temperature / (readings.pressure || 1);\nreadings.vibrationRpmRatio = readings.vibration / (readings.rpm || 1);\n\nreturn { json: readings };"
+      },
+      "id": "data-preprocessing",
+      "name": "Data Preprocessing",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "table": "sensor_readings",
+        "columns": "machine_id, timestamp, temperature, pressure, vibration, humidity, rpm, temp_pressure_ratio, vibration_rpm_ratio",
+        "additionalFields": {
+          "mode": "upsert"
+        }
+      },
+      "id": "store-raw-data",
+      "name": "Store Raw Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [680, 200],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT temperature, pressure, vibration, humidity, rpm, temp_pressure_ratio, vibration_rpm_ratio FROM sensor_readings WHERE machine_id = '{{ $json.machineId }}' ORDER BY timestamp DESC LIMIT 100"
+      },
+      "id": "fetch-historical-data",
+      "name": "Fetch Historical Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Isolation Forest Algorithm Implementation\nclass IsolationForest {\n  constructor(nTrees = 100, subsampleSize = 256) {\n    this.nTrees = nTrees;\n    this.subsampleSize = subsampleSize;\n    this.trees = [];\n  }\n\n  fit(data) {\n    this.trees = [];\n    for (let i = 0; i < this.nTrees; i++) {\n      const sample = this.subsample(data);\n      const tree = this.buildTree(sample, 0, Math.ceil(Math.log2(this.subsampleSize)));\n      this.trees.push(tree);\n    }\n  }\n\n  subsample(data) {\n    const shuffled = [...data].sort(() => 0.5 - Math.random());\n    return shuffled.slice(0, Math.min(this.subsampleSize, data.length));\n  }\n\n  buildTree(data, currentDepth, maxDepth) {\n    if (currentDepth >= maxDepth || data.length <= 1) {\n      return { type: 'leaf', size: data.length };\n    }\n\n    const features = Object.keys(data[0]);\n    const selectedFeature = features[Math.floor(Math.random() * features.length)];\n    const values = data.map(d => d[selectedFeature]).filter(v => v !== undefined && v !== null);\n    \n    if (values.length === 0) {\n      return { type: 'leaf', size: data.length };\n    }\n\n    const minVal = Math.min(...values);\n    const maxVal = Math.max(...values);\n    \n    if (minVal === maxVal) {\n      return { type: 'leaf', size: data.length };\n    }\n\n    const splitValue = minVal + Math.random() * (maxVal - minVal);\n    \n    const leftData = data.filter(d => d[selectedFeature] < splitValue);\n    const rightData = data.filter(d => d[selectedFeature] >= splitValue);\n\n    return {\n      type: 'node',\n      feature: selectedFeature,\n      splitValue: splitValue,\n      left: this.buildTree(leftData, currentDepth + 1, maxDepth),\n      right: this.buildTree(rightData, currentDepth + 1, maxDepth)\n    };\n  }\n\n  pathLength(point, tree, currentDepth = 0) {\n    if (tree.type === 'leaf') {\n      return currentDepth + this.c(tree.size);\n    }\n\n    if (point[tree.feature] < tree.splitValue) {\n      return this.pathLength(point, tree.left, currentDepth + 1);\n    } else {\n      return this.pathLength(point, tree.right, currentDepth + 1);\n    }\n  }\n\n  c(n) {\n    if (n <= 1) return 0;\n    return 2 * (Math.log(n - 1) + 0.5772156649) - (2 * (n - 1) / n);\n  }\n\n  anomalyScore(point) {\n    const avgPathLength = this.trees.reduce((sum, tree) => {\n      return sum + this.pathLength(point, tree);\n    }, 0) / this.trees.length;\n\n    return Math.pow(2, -avgPathLength / this.c(this.subsampleSize));\n  }\n}\n\n// Statistical Anomaly Detection\nfunction calculateZScore(value, mean, stdDev) {\n  return stdDev === 0 ? 0 : Math.abs((value - mean) / stdDev);\n}\n\nfunction calculateStatistics(data, field) {\n  const values = data.map(d => d[field]).filter(v => v !== undefined && v !== null);\n  if (values.length === 0) return { mean: 0, stdDev: 0, min: 0, max: 0 };\n  \n  const mean = values.reduce((a, b) => a + b, 0) / values.length;\n  const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;\n  const stdDev = Math.sqrt(variance);\n  \n  return {\n    mean: mean,\n    stdDev: stdDev,\n    min: Math.min(...values),\n    max: Math.max(...values)\n  };\n}\n\n// Main anomaly detection logic\nconst currentReading = $input.first().json;\nconst historicalData = $input.last().json;\n\nif (!historicalData || historicalData.length < 10) {\n  return {\n    json: {\n      ...currentReading,\n      anomalyScore: 0,\n      isAnomaly: false,\n      anomalyType: 'insufficient_data',\n      confidence: 0,\n      details: 'Insufficient historical data for anomaly detection'\n    }\n  };\n}\n\n// Prepare data for analysis\nconst features = ['temperature', 'pressure', 'vibration', 'humidity', 'rpm', 'temp_pressure_ratio', 'vibration_rpm_ratio'];\nconst cleanHistoricalData = historicalData.map(row => {\n  const cleanRow = {};\n  features.forEach(feature => {\n    cleanRow[feature] = parseFloat(row[feature]) || 0;\n  });\n  return cleanRow;\n});\n\nconst currentData = {};\nfeatures.forEach(feature => {\n  currentData[feature] = parseFloat(currentReading[feature]) || 0;\n});\n\n// Statistical Analysis\nconst statisticalAnomalies = [];\nlet maxZScore = 0;\n\nfeatures.forEach(feature => {\n  const stats = calculateStatistics(cleanHistoricalData, feature);\n  const zScore = calculateZScore(currentData[feature], stats.mean, stats.stdDev);\n  \n  if (zScore > 2) {\n    statisticalAnomalies.push({\n      feature: feature,\n      value: currentData[feature],\n      zScore: zScore,\n      mean: stats.mean,\n      stdDev: stats.stdDev\n    });\n  }\n  \n  maxZScore = Math.max(maxZScore, zScore);\n});\n\n// Isolation Forest Analysis\nconst isolationForest = new IsolationForest(50, Math.min(128, cleanHistoricalData.length));\nisolationForest.fit(cleanHistoricalData);\nconst isolationScore = isolationForest.anomalyScore(currentData);\n\n// Combined anomaly detection\nconst statisticalAnomalyScore = Math.min(maxZScore / 3, 1); // Normalize to 0-1\nconst combinedScore = (isolationScore * 0.6) + (statisticalAnomalyScore * 0.4);\n\n// Determine anomaly threshold and severity\nconst anomalyThreshold = 0.6;\nconst isAnomaly = combinedScore > anomalyThreshold;\n\nlet severity = 'normal';\nlet alertLevel = 'info';\n\nif (combinedScore > 0.8) {\n  severity = 'critical';\n  alertLevel = 'critical';\n} else if (combinedScore > 0.7) {\n  severity = 'high';\n  alertLevel = 'warning';\n} else if (combinedScore > 0.6) {\n  severity = 'medium';\n  alertLevel = 'warning';\n}\n\n// Identify primary anomaly causes\nconst anomalyCauses = statisticalAnomalies\n  .sort((a, b) => b.zScore - a.zScore)\n  .slice(0, 3)\n  .map(a => `${a.feature}: ${a.value.toFixed(2)} (Z-score: ${a.zScore.toFixed(2)})`);\n\nconst result = {\n  ...currentReading,\n  anomalyScore: parseFloat(combinedScore.toFixed(4)),\n  isolationScore: parseFloat(isolationScore.toFixed(4)),\n  statisticalScore: parseFloat(statisticalAnomalyScore.toFixed(4)),\n  isAnomaly: isAnomaly,\n  severity: severity,\n  alertLevel: alertLevel,\n  confidence: parseFloat((combinedScore * 100).toFixed(2)),\n  anomalyCauses: anomalyCauses,\n  statisticalAnomalies: statisticalAnomalies.length,\n  detectionTimestamp: new Date().toISOString(),\n  analysisDetails: {\n    historicalDataPoints: cleanHistoricalData.length,\n    maxZScore: parseFloat(maxZScore.toFixed(2)),\n    threshold: anomalyThreshold\n  }\n};\n\nreturn { json: result };"
+      },
+      "id": "anomaly-detection",
+      "name": "Anomaly Detection Engine",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "table": "anomaly_detections",
+        "columns": "machine_id, timestamp, anomaly_score, isolation_score, statistical_score, is_anomaly, severity, alert_level, confidence, anomaly_causes, detection_timestamp",
+        "additionalFields": {
+          "mode": "upsert"
+        }
+      },
+      "id": "store-anomaly-results",
+      "name": "Store Anomaly Results",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [1120, 200],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {\n          "boolean": [],\n          "number": [\n            {\n              "value1": "={{ $json.isAnomaly }}",\n              "operation": "equal",\n              "value2": true\n            }\n          ],\n          "string": []\n        }\n      },\n      "id": "check-anomaly",\n      "name": "Check if Anomaly",\n      "type": "n8n-nodes-base.if",\n      "typeVersion": 1,\n      "position": [1120, 400]
+    },\n    {\n      "parameters": {\n        "functionCode": "// Create comprehensive alert message\nconst data = $input.first().json;\n\nconst alertMessage = {\n  subject: `🚨 Anomaly Detected - Machine ${data.machineId}`,\n  message: `\n**ANOMALY ALERT**\n\n**Machine ID:** ${data.machineId}\n**Timestamp:** ${data.timestamp}\n**Severity:** ${data.severity.toUpperCase()}\n**Confidence:** ${data.confidence}%\n**Anomaly Score:** ${data.anomalyScore}\n\n**Current Readings:**\n• Temperature: ${data.temperature}°C\n• Pressure: ${data.pressure} bar\n• Vibration: ${data.vibration} Hz\n• Humidity: ${data.humidity}%\n• RPM: ${data.rpm}\n\n**Anomaly Causes:**\n${data.anomalyCauses.map(cause => `• ${cause}`).join('\\n')}\n\n**Recommended Actions:**\n${data.severity === 'critical' ? \n  '🔴 IMMEDIATE ATTENTION REQUIRED - Stop machine and inspect immediately' :\n  data.severity === 'high' ?\n    '🟡 Schedule maintenance within 24 hours' :\n    '🟢 Monitor closely and schedule routine inspection'\n}\n\n**Detection Details:**\n• Historical data points analyzed: ${data.analysisDetails.historicalDataPoints}\n• Maximum Z-score: ${data.analysisDetails.maxZScore}\n• Detection time: ${data.detectionTimestamp}\n  `,\n  webhook_data: {\n    machine_id: data.machineId,\n    severity: data.severity,\n    anomaly_score: data.anomalyScore,\n    timestamp: data.timestamp,\n    causes: data.anomalyCauses\n  }\n};\n\nreturn { json: alertMessage };"
+      },
+      "id": "format-alert",
+      "name": "Format Alert Message",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "fromEmail": "alerts@yourcompany.com",
+        "toEmail": "maintenance@yourcompany.com",
+        "subject": "={{ $json.subject }}",
+        "text": "={{ $json.message }}",
+        "options": {
+          "priority": "high"
+        }
+      },
+      "id": "send-email-alert",
+      "name": "Send Email Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1,
+      "position": [1560, 300],
+      "credentials": {
+        "smtp": {
+          "id": "smtp-credentials",
+          "name": "SMTP Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "{\n  \"text\": \"{{ $json.subject }}\",\n  \"attachments\": [\n    {\n      \"color\": \"{{ $json.webhook_data.severity === 'critical' ? 'danger' : $json.webhook_data.severity === 'high' ? 'warning' : 'good' }}\",\n      \"fields\": [\n        {\n          \"title\": \"Machine ID\",\n          \"value\": \"{{ $json.webhook_data.machine_id }}\",\n          \"short\": true\n        },\n        {\n          \"title\": \"Severity\",\n          \"value\": \"{{ $json.webhook_data.severity }}\",\n          \"short\": true\n        },\n        {\n          \"title\": \"Anomaly Score\",\n          \"value\": \"{{ $json.webhook_data.anomaly_score }}\",\n          \"short\": true\n        },\n        {\n          \"title\": \"Timestamp\",\n          \"value\": \"{{ $json.webhook_data.timestamp }}\",\n          \"short\": true\n        }\n      ]\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "send-slack-alert",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1560, 500]
+    },
+    {
+      "parameters": {
+        "url": "http://grafana:3000/api/annotations",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GRAFANA_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "{\n  \"text\": \"Anomaly detected on {{ $json.webhook_data.machine_id }}\",\n  \"tags\": [\"anomaly\", \"{{ $json.webhook_data.severity }}\", \"machine-{{ $json.webhook_data.machine_id }}\"],\n  \"time\": \"{{ new Date($json.webhook_data.timestamp).getTime() }}\",\n  \"timeEnd\": \"{{ new Date().getTime() }}\"\n}",
+        "options": {}
+      },
+      "id": "create-grafana-annotation",
+      "name": "Create Grafana Annotation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1780, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Send real-time data to monitoring dashboard\nconst data = $input.first().json;\n\n// Prepare metrics for Prometheus/InfluxDB\nconst metrics = {\n  machine_id: data.machineId,\n  timestamp: new Date(data.timestamp).getTime(),\n  temperature: data.temperature,\n  pressure: data.pressure,\n  vibration: data.vibration,\n  humidity: data.humidity,\n  rpm: data.rpm,\n  anomaly_score: data.anomalyScore,\n  is_anomaly: data.isAnomaly ? 1 : 0,\n  severity_level: {\n    'normal': 0,\n    'medium': 1,\n    'high': 2,\n    'critical': 3\n  }[data.severity] || 0\n};\n\nreturn { json: metrics };"
+      },
+      "id": "format-metrics",
+      "name": "Format Metrics",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 600]
+    },
+    {
+      "parameters": {
+        "url": "http://influxdb:8086/write?db=iot_sensors",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "raw",
+        "body": "sensor_data,machine_id={{ $json.machine_id }} temperature={{ $json.temperature }},pressure={{ $json.pressure }},vibration={{ $json.vibration }},humidity={{ $json.humidity }},rpm={{ $json.rpm }},anomaly_score={{ $json.anomaly_score }},is_anomaly={{ $json.is_anomaly }},severity_level={{ $json.severity_level }} {{ $json.timestamp }}",
+        "options": {}
+      },
+      "id": "send-to-influxdb",
+      "name": "Send to InfluxDB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1560, 600]
+    },
+    {
+      "parameters": {
+        "interval": 300,
+        "unit": "seconds"
+      },
+      "id": "maintenance-scheduler",
+      "name": "Maintenance Scheduler",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [240, 700]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT machine_id, COUNT(*) as anomaly_count, AVG(anomaly_score) as avg_score, MAX(anomaly_score) as max_score FROM anomaly_detections WHERE detection_timestamp > NOW() - INTERVAL '1 hour' AND is_anomaly = true GROUP BY machine_id HAVING COUNT(*) > 3 ORDER BY anomaly_count DESC"
+      },
+      "id": "check-maintenance-needed",
+      "name": "Check Maintenance Needed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [460, 700],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Check if maintenance is needed based on anomaly patterns\nconst results = $input.first().json;\n\nif (!results || results.length === 0) {\n  return { json: { maintenanceNeeded: false, message: 'No maintenance required' } };\n}\n\nconst maintenanceAlerts = results.map(machine => {\n  let priority = 'medium';\n  let recommendation = '';\n  \n  if (machine.anomaly_count > 10 || machine.max_score > 0.9) {\n    priority = 'urgent';\n    recommendation = 'Immediate maintenance required - multiple critical anomalies detected';\n  } else if (machine.anomaly_count > 6 || machine.avg_score > 0.7) {\n    priority = 'high';\n    recommendation = 'Schedule maintenance within 24 hours';\n  } else {\n    recommendation = 'Schedule routine maintenance check';\n  }\n  \n  return {\n    machineId: machine.machine_id,\n    anomalyCount: machine.anomaly_count,\n    avgScore: parseFloat(machine.avg_score).toFixed(3),\n    maxScore: parseFloat(machine.max_score).toFixed(3),\n    priority: priority,\n    recommendation: recommendation\n  };\n});\n\nreturn {\n  json: {\n    maintenanceNeeded: true,\n    alertCount: maintenanceAlerts.length,\n    machines: maintenanceAlerts,\n    generatedAt: new Date().toISOString()\n  }\n};\n"
+      },
+      "id": "analyze-maintenance-needs",
+      "name": "Analyze Maintenance Needs",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 700]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.maintenanceNeeded }}",
+              "operation": "equal",
+              "value2": true
+            }
+          ],
+          "number": [],
+          "string": []
+        }
+      },
+      "id": "check-maintenance-alert",
+      "name": "Check Maintenance Alert",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 700]
+    },
+    {
+      "parameters": {
+        "fromEmail": "maintenance@yourcompany.com",
+        "toEmail": "operations@yourcompany.com",
+        "subject": "🔧 Predictive Maintenance Alert - {{ $json.alertCount }} Machines Require Attention",
+        "text": "**PREDICTIVE MAINTENANCE REPORT**\\n\\nGenerated: {{ $json.generatedAt }}\\nMachines requiring attention: {{ $json.alertCount }}\\n\\n{{ $json.machines.map(m => `**Machine ${m.machineId}**\\n- Priority: ${m.priority.toUpperCase()}\\n- Anomalies (last hour): ${m.anomalyCount}\\n- Average Score: ${m.avgScore}\\n- Max Score: ${m.maxScore}\\n- Recommendation: ${m.recommendation}\\n`).join('\\n') }}",
+        "options": {
+          "priority": "high"
+        }
+      },
+      "id": "send-maintenance-alert",
+      "name": "Send Maintenance Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1,
+      "position": [1120, 700],
+      "credentials": {
+        "smtp": {
+          "id": "smtp-credentials",
+          "name": "SMTP Credentials"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "IoT Sensor Webhook": {
+      "main": [
+        [
+          {
+            "node": "Data Preprocessing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Preprocessing": {
+      "main": [
+        [
+          {
+            "node": "Store Raw Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Historical Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Historical Data": {
+      "main": [
+        [
+          {
+            "node": "Anomaly Detection Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anomaly Detection Engine": {
+      "main": [
+        [
+          {
+            "node": "Store Anomaly Results",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check if Anomaly",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Format Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if Anomaly": {
+      "main": [
+        [
+          {
+            "node": "Format Alert Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert Message": {
+      "main": [
+        [
+          {
+            "node": "Send Email Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Slack Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Create Grafana Annotation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Metrics": {
+      "main": [
+        [
+          {
+            "node": "Send to InfluxDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Maintenance Scheduler": {
+      "main": [
+        [
+          {
+            "node": "Check Maintenance Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Maintenance Needed": {
+      "main": [
+        [
+          {
+            "node": "Analyze Maintenance Needs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Maintenance Needs": {
+      "main": [
+        [
+          {
+            "node": "Check Maintenance Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Maintenance Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Maintenance Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "versionId": "1"
+}
